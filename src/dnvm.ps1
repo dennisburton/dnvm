@@ -479,23 +479,47 @@ function Find-Latest {
 
     $RuntimeId = Get-RuntimeId -Architecture:"$architecture" -Runtime:"$runtime"
     $url = "$Feed/GetUpdates()?packageIds=%27$RuntimeId%27&versions=%270.0%27&includePrerelease=true&includeAllVersions=false"
+    Invoke-NuGetWebRequest $url $Proxy
+}
+
+function Find-Package {
+    param(
+        [string]$runtime = "",
+        [string]$architecture = "",
+        [string]$version = "",
+        [string]$Feed,
+        [string]$Proxy
+    )
+
+    $RuntimeId = Get-RuntimeId -Architecture:"$architecture" -Runtime:"$runtime"
+    $url = "$Feed/Packages()?`$filter=Id eq '$RuntimeId' and Version eq '$version'"
+    Invoke-NuGetWebRequest $url $Proxy
+}
+
+function Invoke-NuGetWebRequest {
+    param (
+        [string]$Url,
+        [string]$Proxy
+    )
+
     # NOTE: DO NOT use Invoke-WebRequest. It requires PowerShell 4.0!
 
     $wc = New-Object System.Net.WebClient
     Apply-Proxy $wc -Proxy:$Proxy
-    _WriteDebug "Downloading $url ..."
+    _WriteDebug "Downloading $Url ..."
     try {
-        [xml]$xml = $wc.DownloadString($url)
+        [xml]$xml = $wc.DownloadString($Url)
     } catch {
         $Script:ExitCode = $ExitCodes.NoRuntimesOnFeed
         throw "Unable to find any runtime packages on the feed!"
     }
 
     $version = Select-Xml "//d:Version" -Namespace @{d='http://schemas.microsoft.com/ado/2007/08/dataservices'} $xml
+    $downloadUrl = (Select-Xml "//d:content/@src" -Namespace @{d='http://www.w3.org/2005/Atom'} $xml).Node.value
 
     if($version) {
-        _WriteDebug "Found latest version: $version"
-        $version
+        _WriteDebug "Found $version at $downloadUrl"
+        @{ Version = $version; DownloadUrl = $downloadUrl }
     } else {
         throw "There are no runtimes matching the name $RuntimeId on feed $feed."
     }
@@ -523,21 +547,19 @@ function Get-PackageArch() {
 }
 
 function Download-Package(
-    [string]$Version,
-    [string]$Architecture,
-    [string]$Runtime,
+    [Parameter(Mandatory=$true)]
+    [string]$DownloadUrl,
+    [Parameter(Mandatory=$true)]
     [string]$DestinationFile,
     [Parameter(Mandatory=$true)]
     [string]$Feed,
     [string]$Proxy) {
 
-    $url = "$Feed/package/" + (Get-RuntimeId $Architecture $Runtime) + "/" + $Version
-    
     _WriteOut "Downloading $runtimeFullName from $feed"
     $wc = New-Object System.Net.WebClient
     try {
       Apply-Proxy $wc -Proxy:$Proxy     
-      _WriteDebug "Downloading $url ..."
+      _WriteDebug "Downloading $DownloadUrl ..."
 
       Register-ObjectEvent $wc DownloadProgressChanged -SourceIdentifier WebClient.ProgressChanged -action {
         $Global:downloadData = $eventArgs
@@ -548,14 +570,14 @@ function Download-Package(
         $Global:downloadCompleted = $true
       } | Out-Null
 
-      $wc.DownloadFileAsync($url, $DestinationFile)
+      $wc.DownloadFileAsync($DownloadUrl, $DestinationFile)
 
       while(-not $Global:downloadCompleted){
         $percent = $Global:downloadData.ProgressPercentage
         $totalBytes = $Global:downloadData.TotalBytesToReceive
         $receivedBytes = $Global:downloadData.BytesReceived
         If ($percent -ne $null) {
-            Write-Progress -Activity ("Downloading $RuntimeShortFriendlyName from $url") `
+            Write-Progress -Activity ("Downloading $RuntimeShortFriendlyName from $DownloadUrl") `
                 -Status ("Downloaded $($Global:downloadData.BytesReceived) of $($Global:downloadData.TotalBytesToReceive) bytes") `
                 -PercentComplete $percent -Id 2 -ParentId 1
         }
@@ -569,7 +591,7 @@ function Download-Package(
         }
       }
 
-      Write-Progress -Status "Done" -Activity ("Downloading $RuntimeShortFriendlyName from $url") -Id 2 -ParentId 1 -Completed
+      Write-Progress -Status "Done" -Activity ("Downloading $RuntimeShortFriendlyName from $DownloadUrl") -Id 2 -ParentId 1 -Completed
     }
     finally {
         Remove-Variable downloadData -Scope "Global"
@@ -1095,14 +1117,20 @@ function dnvm-install {
         return
     }
 
-    if ($VersionNuPkgOrAlias -eq "latest") {
-        Write-Progress -Status "Determining Latest Runtime" -Activity "Installing runtime" -Id 1
-        $VersionNuPkgOrAlias = Find-Latest $Runtime $Architecture -Feed:$selectedFeed
-    }
-
     $IsNuPkg = $VersionNuPkgOrAlias.EndsWith(".nupkg")
 
-    if ($IsNuPkg) {
+    if (!$IsNupkg) {
+        if ($VersionNuPkgOrAlias -eq "latest") {
+            Write-Progress -Status "Determining Latest Runtime" -Activity "Installing runtime" -Id 1
+            $findPackageResult = Find-Latest $Runtime $Architecture -Feed:$selectedFeed
+            $PackageVersion = $findPackageResult.Version
+            $runtimeFullName = Get-RuntimeName $PackageVersion -Architecture:$Architecture -Runtime:$Runtime
+        } else {
+            $runtimeFullName = Get-RuntimeName $VersionNuPkgOrAlias -Architecture:$Architecture -Runtime:$Runtime
+            $PackageVersion = Get-PackageVersion $runtimeFullName
+            $findPackageResult = Find-Package $Runtime $Architecture -Feed:$selectedFeed $PackageVersion
+        }
+    } else {
         if(!(Test-Path $VersionNuPkgOrAlias)) {
             throw "Unable to locate package file: '$VersionNuPkgOrAlias'"
         }
@@ -1110,12 +1138,9 @@ function dnvm-install {
         $runtimeFullName = [System.IO.Path]::GetFileNameWithoutExtension($VersionNuPkgOrAlias)
         $Architecture = Get-PackageArch $runtimeFullName
         $Runtime = Get-PackageRuntime $runtimeFullName
-    } else {
-        $runtimeFullName = Get-RuntimeName $VersionNuPkgOrAlias -Architecture:$Architecture -Runtime:$Runtime
+        $PackageVersion = Get-PackageVersion $runtimeFullName
     }
 
-    $PackageVersion = Get-PackageVersion $runtimeFullName
-    
     _WriteDebug "Preparing to install runtime '$runtimeFullName'"
     _WriteDebug "Architecture: $Architecture"
     _WriteDebug "Runtime: $Runtime"
@@ -1155,7 +1180,7 @@ function dnvm-install {
             Write-Progress -Activity "Installing runtime" -Status "Downloading runtime" -Id 1
             _WriteDebug "Downloading version $VersionNuPkgOrAlias to $DownloadFile"
 
-            Download-Package $PackageVersion $Architecture $Runtime $DownloadFile -Proxy:$Proxy -Feed:$selectedFeed
+            Download-Package $findPackageResult.DownloadUrl $DownloadFile -Proxy:$Proxy -Feed:$selectedFeed
         }
 
         Write-Progress -Activity "Installing runtime" -Status "Unpacking runtime" -Id 1
